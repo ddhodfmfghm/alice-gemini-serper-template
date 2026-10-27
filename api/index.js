@@ -1,6 +1,6 @@
-const DEFAULT_MODEL = "gemini-2.5-flash-lite";
-// Ставим самую стабильную модель на бесплатном тарифе на первое место
-const FALLBACK_MODELS = ["gemini-2.5-flash-lite", "gemini-3.8-flash", "gemini-3.1-flash-lite"];
+const DEFAULT_MODEL = "gemini-3.1-flash-lite";
+// Ставим на первое место стабильную 3.1-flash-lite, затем другие доступные модели
+const FALLBACK_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.8-flash"];
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
@@ -8,8 +8,8 @@ const MAX_ALICE_TEXT = 1024;
 // Лимиты времени
 const TOTAL_RESPONSE_BUDGET_MS = 4300; // Алиса ждет ~4.5 сек, оставляем запас
 const SERPER_TIMEOUT_MS = 1000;        // Поиск не дольше 1 секунды
-const GEMINI_PRIMARY_TIMEOUT_MS = 1800; // Первая модель (2.5-flash-lite) должна ответить за 1.8 сек
-const GEMINI_FALLBACK_TIMEOUT_MS = 2200; // Вторая модель получает оставшееся время
+const GEMINI_PRIMARY_TIMEOUT_MS = 2000; // Увеличили время для первой модели до 2 сек
+const GEMINI_FALLBACK_TIMEOUT_MS = 2000; // И для резервной модели тоже 2 сек
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
