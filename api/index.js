@@ -1,10 +1,11 @@
-const DEFAULT_MODEL = "gemini-3.1-flash-lite";
+const DEFAULT_MODEL = "gemini-3.8-flash";
+const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4200;
+const TOTAL_RESPONSE_BUDGET_MS = 4400; // Оставили запас до 4.5 сек лимита Алисы
 const SERPER_TIMEOUT_MS = 1500;
-const GEMINI_TIMEOUT_MS = 3500;
+const GEMINI_TIMEOUT_MS = 4000;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -115,9 +116,6 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
-
   const contents = safeHistory(history).map(item => ({
     role: item.role,
     parts: [{ text: item.text }]
@@ -128,48 +126,65 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": key
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
+  // Формируем список моделей для перебора. Если в Vercel задана переменная GEMINI_MODEL, она будет первой.
+  let modelsToTry = FALLBACK_MODELS;
+  if (process.env.GEMINI_MODEL && process.env.GEMINI_MODEL.trim() !== "") {
+    modelsToTry = [process.env.GEMINI_MODEL.trim(), ...FALLBACK_MODELS];
+  }
+  // Убираем дубликаты из списка
+  modelsToTry = [...new Set(modelsToTry)];
+
+  let lastError = new Error("GEMINI_REQUEST_FAILED");
+
+  for (const model of modelsToTry) {
+    if (!/^[A-Za-z0-9._-]+$/.test(model)) continue;
+
+    try {
+      const { response, data } = await fetchJson(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": key
+          },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+            contents,
+            generationConfig: {
+              temperature: 0.5,
+              maxOutputTokens: 240
+            }
+          })
+        },
+        Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+      );
+
+      if (response.ok) {
+        const candidate = data?.candidates?.[0];
+        const answer = (candidate?.content?.parts || [])
+          .map(part => typeof part.text === "string" ? part.text : "")
+          .join("")
+          .trim();
+
+        if (answer) {
+          return answer; // Успех! Возвращаем ответ
         }
-      })
-    },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
-  );
-
-  if (!response.ok) {
-    const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
+      } else {
+        const status = Number(response.status);
+        console.warn(`Model ${model} failed with HTTP ${status}. Trying next...`);
+        if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
+        if (status === 429) lastError = new Error("GEMINI_QUOTA");
+        if (status === 503) lastError = new Error("GEMINI_OVERLOADED");
+      }
+    } catch (error) {
+      if (error.message === "GEMINI_KEY_REJECTED") throw error; // Если ключ неверный, нет смысла перебирать модели
+      console.warn(`Error with model ${model}:`, error.message);
+      lastError = error;
+    }
   }
 
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
-
-  if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
-  }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
-  }
-  return answer;
+  throw lastError;
 }
 
 function errorForUser(error) {
@@ -180,6 +195,8 @@ function errorForUser(error) {
       return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
     case "GEMINI_QUOTA":
       return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
+    case "GEMINI_OVERLOADED":
+      return "Нейросеть сейчас перегружена. Попробуйте задать вопрос еще раз через минуту.";
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "TIME_BUDGET_EXHAUSTED":
