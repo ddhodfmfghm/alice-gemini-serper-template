@@ -1,15 +1,11 @@
-const DEFAULT_MODEL = "gemini-3.1-flash-lite";
-// Ставим на первое место стабильную 3.1-flash-lite, затем другие доступные модели
-const FALLBACK_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.8-flash"];
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 
 // Лимиты времени
-const TOTAL_RESPONSE_BUDGET_MS = 4300; // Алиса ждет ~4.5 сек, оставляем запас
+const TOTAL_RESPONSE_BUDGET_MS = 4300; // Алиса ждет ~4.5 сек
 const SERPER_TIMEOUT_MS = 1000;        // Поиск не дольше 1 секунды
-const GEMINI_PRIMARY_TIMEOUT_MS = 2000; // Увеличили время для первой модели до 2 сек
-const GEMINI_FALLBACK_TIMEOUT_MS = 2000; // И для резервной модели тоже 2 сек
+const GEMINI_TIMEOUT_MS = 2200;        // Время на ответ для одной модели Gemini
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -115,6 +111,37 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
+// Получаем список актуальных моделей, поддерживающих generateContent
+async function getAvailableModels(key) {
+  try {
+    const { response, data } = await fetchJson(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${key}`,
+      { method: "GET" },
+      1500 // Быстрый запрос, чтобы не тратить бюджет
+    );
+
+    if (!response.ok || !Array.isArray(data.models)) {
+      console.warn("Could not fetch models list, using default fallback.");
+      return ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash"];
+    }
+
+    // Оставляем только те, что поддерживают generateContent, и сортируем: сначала flash-lite, потом flash
+    const available = data.models
+      .filter(m => m.supportedGenerationMethods?.includes("generateContent") && m.name)
+      .map(m => m.name.replace("models/", ""))
+      .sort((a, b) => {
+        if (a.includes("flash-lite") && !b.includes("flash-lite")) return -1;
+        if (!a.includes("flash-lite") && b.includes("flash-lite")) return 1;
+        return 0;
+      });
+
+    return available.length > 0 ? available.slice(0, 3) : ["gemini-3.5-flash"];
+  } catch (error) {
+    console.warn("Error fetching models:", error.message);
+    return ["gemini-3.5-flash", "gemini-3.5-flash-lite"];
+  }
+}
+
 async function askGemini(text, history, searchContext, maxTotalTimeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
@@ -129,32 +156,22 @@ async function askGemini(text, history, searchContext, maxTotalTimeoutMs) {
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  let modelsToTry = FALLBACK_MODELS;
-  if (process.env.GEMINI_MODEL && process.env.GEMINI_MODEL.trim() !== "") {
-    modelsToTry = [process.env.GEMINI_MODEL.trim(), ...FALLBACK_MODELS];
-  }
-  modelsToTry = [...new Set(modelsToTry)];
+  // Получаем актуальный список моделей для вашего ключа
+  const modelsToTry = await getAvailableModels(key);
 
   const startTime = Date.now();
   let lastError = new Error("GEMINI_REQUEST_FAILED");
 
   for (let i = 0; i < modelsToTry.length; i++) {
     const model = modelsToTry[i];
-    if (!/^[A-Za-z0-9._-]+$/.test(model)) continue;
-
+    
+    // Проверяем, сколько времени осталось
     const elapsed = Date.now() - startTime;
     let remainingTime = maxTotalTimeoutMs - elapsed;
 
-    if (remainingTime < 300) {
+    if (remainingTime < 500) {
       console.warn("Time budget exhausted before trying model", model);
       break;
-    }
-
-    let currentTimeout;
-    if (i === 0) {
-      currentTimeout = Math.min(GEMINI_PRIMARY_TIMEOUT_MS, remainingTime);
-    } else {
-      currentTimeout = Math.min(GEMINI_FALLBACK_TIMEOUT_MS, remainingTime);
     }
 
     try {
@@ -175,7 +192,7 @@ async function askGemini(text, history, searchContext, maxTotalTimeoutMs) {
             }
           })
         },
-        currentTimeout
+        Math.min(GEMINI_TIMEOUT_MS, remainingTime)
       );
 
       if (response.ok) {
