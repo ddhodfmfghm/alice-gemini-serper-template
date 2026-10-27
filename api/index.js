@@ -1,11 +1,14 @@
 const DEFAULT_MODEL = "gemini-3.8-flash";
-const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
+const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash"];
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4400; // Оставили запас до 4.5 сек лимита Алисы
-const SERPER_TIMEOUT_MS = 1500;
-const GEMINI_TIMEOUT_MS = 4000;
+
+// Лимиты времени
+const TOTAL_RESPONSE_BUDGET_MS = 4300; // Общий лимит (Алиса ждет ~4.5с)
+const SERPER_TIMEOUT_MS = 1000;        // Поиск не должен занимать больше 1 секунды
+const GEMINI_PRIMARY_TIMEOUT_MS = 1800; // Первая модель получает только 1.8 сек
+const GEMINI_FALLBACK_TIMEOUT_MS = 2200; // Вторая модель получает 2.2 сек
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -111,10 +114,9 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
+async function askGemini(text, history, searchContext, maxTotalTimeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
-  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const contents = safeHistory(history).map(item => ({
     role: item.role,
@@ -126,18 +128,35 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  // Формируем список моделей для перебора. Если в Vercel задана переменная GEMINI_MODEL, она будет первой.
   let modelsToTry = FALLBACK_MODELS;
   if (process.env.GEMINI_MODEL && process.env.GEMINI_MODEL.trim() !== "") {
     modelsToTry = [process.env.GEMINI_MODEL.trim(), ...FALLBACK_MODELS];
   }
-  // Убираем дубликаты из списка
   modelsToTry = [...new Set(modelsToTry)];
 
+  const startTime = Date.now();
   let lastError = new Error("GEMINI_REQUEST_FAILED");
 
-  for (const model of modelsToTry) {
+  for (let i = 0; i < modelsToTry.length; i++) {
+    const model = modelsToTry[i];
     if (!/^[A-Za-z0-9._-]+$/.test(model)) continue;
+
+    // Высчитываем оставшееся общее время
+    const elapsed = Date.now() - startTime;
+    let remainingTime = maxTotalTimeoutMs - elapsed;
+
+    if (remainingTime < 300) {
+      console.warn("Time budget exhausted before trying model", model);
+      break;
+    }
+
+    // Распределяем время: первой модели даем 1.8 сек, второй — остаток (но не больше 2.2 сек)
+    let currentTimeout;
+    if (i === 0) {
+      currentTimeout = Math.min(GEMINI_PRIMARY_TIMEOUT_MS, remainingTime);
+    } else {
+      currentTimeout = Math.min(GEMINI_FALLBACK_TIMEOUT_MS, remainingTime);
+    }
 
     try {
       const { response, data } = await fetchJson(
@@ -157,7 +176,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
             }
           })
         },
-        Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+        currentTimeout
       );
 
       if (response.ok) {
@@ -168,7 +187,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
           .trim();
 
         if (answer) {
-          return answer; // Успех! Возвращаем ответ
+          return answer;
         }
       } else {
         const status = Number(response.status);
@@ -178,7 +197,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         if (status === 503) lastError = new Error("GEMINI_OVERLOADED");
       }
     } catch (error) {
-      if (error.message === "GEMINI_KEY_REJECTED") throw error; // Если ключ неверный, нет смысла перебирать модели
+      if (error.message === "GEMINI_KEY_REJECTED") throw error;
       console.warn(`Error with model ${model}:`, error.message);
       lastError = error;
     }
@@ -241,11 +260,12 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
+    // Передаем в askGemini оставшееся время с запасом 400мс на сетевые задержки
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, remainingMs() - 400)
     );
 
     const history = [
