@@ -1,14 +1,15 @@
-const DEFAULT_MODEL = "gemini-3.8-flash";
-const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash"];
+const DEFAULT_MODEL = "gemini-2.5-flash-lite";
+// Ставим самую стабильную модель на бесплатном тарифе на первое место
+const FALLBACK_MODELS = ["gemini-2.5-flash-lite", "gemini-3.8-flash", "gemini-3.1-flash-lite"];
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 
 // Лимиты времени
-const TOTAL_RESPONSE_BUDGET_MS = 4300; // Общий лимит (Алиса ждет ~4.5с)
-const SERPER_TIMEOUT_MS = 1000;        // Поиск не должен занимать больше 1 секунды
-const GEMINI_PRIMARY_TIMEOUT_MS = 1800; // Первая модель получает только 1.8 сек
-const GEMINI_FALLBACK_TIMEOUT_MS = 2200; // Вторая модель получает 2.2 сек
+const TOTAL_RESPONSE_BUDGET_MS = 4300; // Алиса ждет ~4.5 сек, оставляем запас
+const SERPER_TIMEOUT_MS = 1000;        // Поиск не дольше 1 секунды
+const GEMINI_PRIMARY_TIMEOUT_MS = 1800; // Первая модель (2.5-flash-lite) должна ответить за 1.8 сек
+const GEMINI_FALLBACK_TIMEOUT_MS = 2200; // Вторая модель получает оставшееся время
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -141,7 +142,6 @@ async function askGemini(text, history, searchContext, maxTotalTimeoutMs) {
     const model = modelsToTry[i];
     if (!/^[A-Za-z0-9._-]+$/.test(model)) continue;
 
-    // Высчитываем оставшееся общее время
     const elapsed = Date.now() - startTime;
     let remainingTime = maxTotalTimeoutMs - elapsed;
 
@@ -150,7 +150,6 @@ async function askGemini(text, history, searchContext, maxTotalTimeoutMs) {
       break;
     }
 
-    // Распределяем время: первой модели даем 1.8 сек, второй — остаток (но не больше 2.2 сек)
     let currentTimeout;
     if (i === 0) {
       currentTimeout = Math.min(GEMINI_PRIMARY_TIMEOUT_MS, remainingTime);
@@ -260,7 +259,6 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    // Передаем в askGemini оставшееся время с запасом 400мс на сетевые задержки
     const answer = await askGemini(
       text,
       oldHistory,
