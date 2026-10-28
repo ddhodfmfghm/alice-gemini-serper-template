@@ -2,12 +2,11 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 
-// Увеличиваем бюджет времени до 8.5 секунд. 
-// ВАЖНО: Убедитесь, что в настройках вашего хостинга (например, Vercel) 
-// таймаут функции установлен не менее 10 секунд!
-const TOTAL_RESPONSE_BUDGET_MS = 8500;
-const SERPER_TIMEOUT_MS = 500;
-const GEMINI_TIMEOUT_MS = 3500;
+// Жёсткий лимит Яндекс Алисы — 4,5 секунды. 
+// Оставляем 400 мс на сетевые задержки Vercel и формирование ответа.
+const TOTAL_RESPONSE_BUDGET_MS = 4100; 
+const SERPER_TIMEOUT_MS = 400;
+const GEMINI_TIMEOUT_MS = 3000;
 
 const GEMINI_MODEL =
   process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
@@ -174,7 +173,7 @@ function getGeminiErrorMessage(data) {
 }
 
 // Функция для расчета задержки перед повтором (Exponential Backoff)
-function getBackoffDelay(attempt, baseDelayMs = 1000) {
+function getBackoffDelay(attempt, baseDelayMs = 600) {
   const exponentialDelay = baseDelayMs * Math.pow(2, attempt);
   // Добавляем случайный разброс (джиттер) от 0.7 до 1.3
   return Math.floor(exponentialDelay * (0.7 + Math.random() * 0.6));
@@ -187,7 +186,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     throw new Error("MISSING_GEMINI_KEY");
   }
 
-  if (timeoutMs < 1000) {
+  if (timeoutMs < 800) {
     throw new Error("TIME_BUDGET_EXHAUSTED");
   }
 
@@ -213,13 +212,12 @@ ${searchContext}
     parts: [{ text: prompt }]
   });
 
-  // Расширенный список резервных моделей
+  // Актуальные модели, поддерживающие v1beta (по состоянию на 2026 год)
   const defaultModels = [
-    GEMINI_MODEL,
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
-    "gemini-3.1-flash-lite",
-    "gemini-2.5-flash-lite"
+    GEMINI_MODEL,                 // По умолчанию gemini-3.5-flash-lite
+    "gemini-3.5-flash",           // Чуть мощнее, но всё ещё быстрая
+    "gemini-3.1-flash-lite",      // Резервная lite-модель
+    "gemini-3-flash-preview"      // Ещё один быстрый вариант
   ];
 
   const models = [...new Set(defaultModels)];
@@ -235,14 +233,15 @@ ${searchContext}
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const remaining = remainingMs();
 
-      // Если времени осталось мало, прерываемся
+      // Если времени осталось мало, прерываемся, чтобы не ловить таймаут Алисы
       if (remaining < 800) {
         throw lastError;
       }
 
+      // Оставляем буфер на обработку ответа
       const timeout = Math.min(
         GEMINI_TIMEOUT_MS,
-        Math.max(800, remaining - 500)
+        Math.max(800, remaining - 300)
       );
 
       const url =
@@ -315,7 +314,7 @@ ${searchContext}
           lastError = new Error("GEMINI_OVERLOADED");
           
           // Если есть время и это не последняя попытка для этой модели, делаем задержку
-          if (attempt < maxAttempts - 1 && remainingMs() > 1500) {
+          if (attempt < maxAttempts - 1 && remainingMs() > 1200) {
             const delay = getBackoffDelay(attempt);
             console.warn(`Model ${model} overloaded. Retrying in ${delay}ms...`);
             await sleep(delay);
@@ -431,10 +430,10 @@ export default async function handler(req, res) {
     let searchContext = "";
 
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Оставляем на поиск не более 500мс, остальное отдаем Gemini
+      // На поиск выделяем не более 400мс, чтобы осталось время на Gemini
       const searchBudget = Math.min(
         SERPER_TIMEOUT_MS,
-        Math.max(0, remainingMs() - 4000) 
+        Math.max(0, remainingMs() - 3000) 
       );
 
       if (searchBudget >= 150) {
@@ -442,7 +441,8 @@ export default async function handler(req, res) {
       }
     }
 
-    const geminiBudget = Math.max(0, remainingMs() - 250);
+    // Оставляем буфер в 300мс на финальную обработку ответа
+    const geminiBudget = Math.max(0, remainingMs() - 300);
 
     const answer = await askGemini(
       text,
