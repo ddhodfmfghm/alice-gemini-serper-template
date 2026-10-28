@@ -2,10 +2,8 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 
-// Увеличиваем общий бюджет до 4.2 секунд (лимит Алисы - 4.5 сек)
 const TOTAL_RESPONSE_BUDGET_MS = 4200; 
 const SERPER_TIMEOUT_MS = 400;
-// Увеличиваем таймаут для Gemini, так как модели нужен запас
 const GEMINI_TIMEOUT_MS = 3800;
 
 const GEMINI_MODEL =
@@ -172,7 +170,6 @@ function getGeminiErrorMessage(data) {
   return message.replace(/\s+/g, " ").slice(0, 300);
 }
 
-// Функция для расчета задержки перед повтором (Exponential Backoff)
 function getBackoffDelay(attempt, baseDelayMs = 600) {
   const exponentialDelay = baseDelayMs * Math.pow(2, attempt);
   return Math.floor(exponentialDelay * (0.7 + Math.random() * 0.6));
@@ -263,9 +260,9 @@ ${searchContext}
               generationConfig: {
                 temperature: 0.4,
                 maxOutputTokens: 160,
-                // Ключевое исправление: отключаем "размышления"
+                // ИСПРАВЛЕНИЕ: используем thinkingLevel вместо thinkingBudget
                 thinkingConfig: {
-                  thinkingBudget: 0
+                  thinkingLevel: "MINIMAL"
                 }
               }
             })
@@ -299,7 +296,9 @@ ${searchContext}
           throw new Error("GEMINI_QUOTA");
         }
         if (response.status === 400) {
-          throw new Error("GEMINI_BAD_REQUEST");
+          // Если 400 всё ещё возникает, пробуем следующую модель
+          lastError = new Error("GEMINI_BAD_REQUEST");
+          break;
         }
 
         if (response.status === 503 || response.status >= 500) {
