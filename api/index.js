@@ -5,7 +5,7 @@ const MAX_ALICE_TEXT = 1024;
 // Лимиты времени
 const TOTAL_RESPONSE_BUDGET_MS = 4300; // Алиса ждет ~4.5 сек
 const SERPER_TIMEOUT_MS = 1000;        // Поиск не дольше 1 секунды
-const GEMINI_TIMEOUT_MS = 2200;        // Время на ответ для одной модели Gemini
+const GEMINI_TIMEOUT_MS = 2800;        // Увеличили время на ответ для Gemini
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -111,37 +111,6 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-// Получаем список актуальных моделей, поддерживающих generateContent
-async function getAvailableModels(key) {
-  try {
-    const { response, data } = await fetchJson(
-      `https://generativelanguage.googleapis.com/v1beta/models?key=${key}`,
-      { method: "GET" },
-      1500 // Быстрый запрос, чтобы не тратить бюджет
-    );
-
-    if (!response.ok || !Array.isArray(data.models)) {
-      console.warn("Could not fetch models list, using default fallback.");
-      return ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash"];
-    }
-
-    // Оставляем только те, что поддерживают generateContent, и сортируем: сначала flash-lite, потом flash
-    const available = data.models
-      .filter(m => m.supportedGenerationMethods?.includes("generateContent") && m.name)
-      .map(m => m.name.replace("models/", ""))
-      .sort((a, b) => {
-        if (a.includes("flash-lite") && !b.includes("flash-lite")) return -1;
-        if (!a.includes("flash-lite") && b.includes("flash-lite")) return 1;
-        return 0;
-      });
-
-    return available.length > 0 ? available.slice(0, 3) : ["gemini-3.5-flash"];
-  } catch (error) {
-    console.warn("Error fetching models:", error.message);
-    return ["gemini-3.5-flash", "gemini-3.5-flash-lite"];
-  }
-}
-
 async function askGemini(text, history, searchContext, maxTotalTimeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
@@ -156,8 +125,9 @@ async function askGemini(text, history, searchContext, maxTotalTimeoutMs) {
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  // Получаем актуальный список моделей для вашего ключа
-  const modelsToTry = await getAvailableModels(key);
+  // ИСПРАВЛЕНИЕ: Используем только реальные, быстрые модели без лишних запросов
+  // gemini-1.5-flash-8b — самая быстрая и имеет лучшие бесплатные лимиты
+  const modelsToTry = ["gemini-1.5-flash-8b", "gemini-1.5-flash"];
 
   const startTime = Date.now();
   let lastError = new Error("GEMINI_REQUEST_FAILED");
@@ -174,48 +144,78 @@ async function askGemini(text, history, searchContext, maxTotalTimeoutMs) {
       break;
     }
 
-    try {
-      const { response, data } = await fetchJson(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-goog-api-key": key
+    // ИСПРАВЛЕНИЕ: Добавляем цикл для повторных попыток (до 2 раз) при ошибке 503
+    let attempts = 0;
+    const maxAttempts = 2;
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      
+      try {
+        const { response, data } = await fetchJson(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": key
+            },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+              contents,
+              generationConfig: {
+                temperature: 0.5,
+                maxOutputTokens: 240
+              }
+            })
           },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-            contents,
-            generationConfig: {
-              temperature: 0.5,
-              maxOutputTokens: 240
+          Math.min(GEMINI_TIMEOUT_MS, remainingTime)
+        );
+
+        if (response.ok) {
+          const candidate = data?.candidates?.[0];
+          const answer = (candidate?.content?.parts || [])
+            .map(part => typeof part.text === "string" ? part.text : "")
+            .join("")
+            .trim();
+
+          if (answer) {
+            return answer;
+          }
+          break; // Если ответ пустой, но статус 200, переходим к следующей модели
+        } else {
+          const status = Number(response.status);
+          console.warn(`Model ${model} failed with HTTP ${status} (Attempt ${attempts}/${maxAttempts}).`);
+          
+          if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
+          
+          if (status === 429) {
+            lastError = new Error("GEMINI_QUOTA");
+            break; // Нет смысла пытаться снова при лимите
+          }
+          
+          if (status === 503) {
+            lastError = new Error("GEMINI_OVERLOADED");
+            // Если сервер перегружен и есть запас времени, пробуем еще раз
+            if (attempts < maxAttempts && remainingTime > 1500) {
+              console.warn(`Model ${model} is overloaded. Retrying in 500ms...`);
+              await new Promise(resolve => setTimeout(resolve, 500));
+              continue; // Повторяем цикл while для этой же модели
             }
-          })
-        },
-        Math.min(GEMINI_TIMEOUT_MS, remainingTime)
-      );
-
-      if (response.ok) {
-        const candidate = data?.candidates?.[0];
-        const answer = (candidate?.content?.parts || [])
-          .map(part => typeof part.text === "string" ? part.text : "")
-          .join("")
-          .trim();
-
-        if (answer) {
-          return answer;
+          }
+          
+          break; // При других ошибках (например, 404) переходим к следующей модели
         }
-      } else {
-        const status = Number(response.status);
-        console.warn(`Model ${model} failed with HTTP ${status}. Trying next...`);
-        if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-        if (status === 429) lastError = new Error("GEMINI_QUOTA");
-        if (status === 503) lastError = new Error("GEMINI_OVERLOADED");
+      } catch (error) {
+        if (error.message === "GEMINI_KEY_REJECTED") throw error;
+        if (error.name === "AbortError") {
+           console.warn(`Model ${model} aborted due to timeout.`);
+           break; // Превышен таймаут, нет смысла повторять
+        }
+        console.warn(`Error with model ${model} (Attempt ${attempts}):`, error.message);
+        lastError = error;
+        break; 
       }
-    } catch (error) {
-      if (error.message === "GEMINI_KEY_REJECTED") throw error;
-      console.warn(`Error with model ${model}:`, error.message);
-      lastError = error;
     }
   }
 
