@@ -7,7 +7,6 @@ const TOTAL_RESPONSE_BUDGET_MS = 4300;
 const SERPER_TIMEOUT_MS = 700;
 const GEMINI_TIMEOUT_MS = 3000;
 
-// Модель можно изменить в переменных окружения Vercel
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
 const SYSTEM_PROMPT = [
@@ -83,9 +82,7 @@ async function fetchJson(url, options, timeoutMs) {
   const controller = new AbortController();
   const timeout = Math.max(100, timeoutMs);
 
-  const timer = setTimeout(() => {
-    controller.abort();
-  }, timeout);
+  const timer = setTimeout(() => controller.abort(), timeout);
 
   try {
     const response = await fetch(url, {
@@ -174,7 +171,7 @@ function getGeminiErrorMessage(data) {
 
   if (typeof message !== "string") return "";
 
-  // Не записываем API-ключи в логи
+  // Не выводим API-ключи в логи
   return message.replace(/\s+/g, " ").slice(0, 300);
 }
 
@@ -239,10 +236,7 @@ ${searchContext}
           contents,
           generationConfig: {
             temperature: 0.4,
-            maxOutputTokens: 160,
-            thinkingConfig: {
-              thinkingLevel: "MINIMAL"
-            }
+            maxOutputTokens: 160
           }
         })
       },
