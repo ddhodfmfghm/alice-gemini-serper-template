@@ -1,13 +1,14 @@
+
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 
-// Ограничения времени ответа Алисы
 const TOTAL_RESPONSE_BUDGET_MS = 4300;
-const SERPER_TIMEOUT_MS = 700;
-const GEMINI_TIMEOUT_MS = 3000;
+const SERPER_TIMEOUT_MS = 500;
+const GEMINI_TIMEOUT_MS = 3500;
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
+const GEMINI_MODEL =
+  process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -81,7 +82,6 @@ function safeHistory(history) {
 async function fetchJson(url, options, timeoutMs) {
   const controller = new AbortController();
   const timeout = Math.max(100, timeoutMs);
-
   const timer = setTimeout(() => controller.abort(), timeout);
 
   try {
@@ -91,7 +91,6 @@ async function fetchJson(url, options, timeoutMs) {
     });
 
     const data = await response.json().catch(() => ({}));
-
     return { response, data };
   } finally {
     clearTimeout(timer);
@@ -123,9 +122,7 @@ async function searchWeb(query, timeoutMs) {
     );
 
     if (!response.ok) {
-      console.warn(
-        `Serper request failed: HTTP ${response.status}`
-      );
+      console.warn(`Serper request failed: HTTP ${response.status}`);
       return "";
     }
 
@@ -152,10 +149,8 @@ async function searchWeb(query, timeoutMs) {
 
     return items.length ? items.join("\n") : "";
   } catch (error) {
-    const timedOut = error?.name === "AbortError";
-
     console.warn(
-      timedOut
+      error?.name === "AbortError"
         ? "Serper request timed out; continuing without web search."
         : `Serper request failed: ${String(
             error?.message || "unknown error"
@@ -171,7 +166,6 @@ function getGeminiErrorMessage(data) {
 
   if (typeof message !== "string") return "";
 
-  // Не выводим API-ключи в логи
   return message.replace(/\s+/g, " ").slice(0, 300);
 }
 
@@ -182,9 +176,12 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     throw new Error("MISSING_GEMINI_KEY");
   }
 
-  if (timeoutMs < 500) {
+  if (timeoutMs < 1000) {
     throw new Error("TIME_BUDGET_EXHAUSTED");
   }
+
+  const startedAt = Date.now();
+  const remainingMs = () => timeoutMs - (Date.now() - startedAt);
 
   const contents = safeHistory(history).map(item => ({
     role: item.role,
@@ -205,118 +202,154 @@ ${searchContext}
     parts: [{ text: prompt }]
   });
 
-  const timeout = Math.max(
-    500,
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
-  );
+  const fallbackModel =
+    GEMINI_MODEL === "gemini-3.5-flash-lite"
+      ? "gemini-3.1-flash-lite"
+      : "gemini-3.5-flash-lite";
 
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/` +
-    `${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const models = [...new Set([GEMINI_MODEL, fallbackModel])];
+  let lastError = new Error("GEMINI_REQUEST_FAILED");
 
-  console.info(
-    `Gemini request started; model=${GEMINI_MODEL}; timeoutMs=${timeout}`
-  );
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    const attemptsLeft = models.length - i;
+    const remaining = remainingMs();
 
-  let result;
+    if (remaining < 500) throw lastError;
 
-  try {
-    result = await fetchJson(
-      url,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": key
-        },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [{ text: SYSTEM_PROMPT }]
-          },
-          contents,
-          generationConfig: {
-            temperature: 0.4,
-            maxOutputTokens: 160
-          }
-        })
-      },
-      timeout
+    const timeout = Math.min(
+      GEMINI_TIMEOUT_MS,
+      Math.max(500, Math.floor(remaining / attemptsLeft))
     );
-  } catch (error) {
-    if (error?.name === "AbortError") {
+
+    const url =
+      "https://generativelanguage.googleapis.com/v1beta/models/" +
+      `${encodeURIComponent(model)}:generateContent`;
+
+    console.info(
+      `Gemini request started; model=${model}; timeoutMs=${timeout}`
+    );
+
+    let result;
+
+    try {
+      result = await fetchJson(
+        url,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": key
+          },
+          body: JSON.stringify({
+            systemInstruction: {
+              parts: [{ text: SYSTEM_PROMPT }]
+            },
+            contents,
+            generationConfig: {
+              temperature: 0.4,
+              maxOutputTokens: 160
+            }
+          })
+        },
+        timeout
+      );
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        console.warn(
+          `Gemini request timed out; model=${model}; timeoutMs=${timeout}`
+        );
+        lastError = new Error("GEMINI_TIMEOUT");
+      } else {
+        console.warn(
+          `Gemini network error; model=${model}; message=${String(
+            error?.message || "unknown error"
+          ).slice(0, 180)}`
+        );
+        lastError = new Error("GEMINI_NETWORK_ERROR");
+      }
+
+      if (i < models.length - 1 && remainingMs() >= 500) {
+        continue;
+      }
+
+      throw lastError;
+    }
+
+    const { response, data } = result;
+
+    if (!response.ok) {
+      const apiMessage = getGeminiErrorMessage(data);
+
       console.warn(
-        `Gemini request timed out; model=${GEMINI_MODEL}; timeoutMs=${timeout}`
+        `Gemini API error; model=${model}; status=${response.status}; message=${apiMessage || "no error message"}`
       );
 
-      throw new Error("GEMINI_TIMEOUT");
+      if (response.status === 401 || response.status === 403) {
+        throw new Error("GEMINI_KEY_REJECTED");
+      }
+
+      if (response.status === 429) {
+        throw new Error("GEMINI_QUOTA");
+      }
+
+      if (response.status === 400) {
+        throw new Error("GEMINI_BAD_REQUEST");
+      }
+
+      if (
+        response.status === 404 ||
+        response.status === 503 ||
+        response.status >= 500
+      ) {
+        lastError = new Error(
+          response.status === 404
+            ? "GEMINI_MODEL_NOT_FOUND"
+            : "GEMINI_OVERLOADED"
+        );
+
+        if (i < models.length - 1 && remainingMs() >= 500) {
+          continue;
+        }
+
+        throw lastError;
+      }
+
+      throw new Error("GEMINI_REQUEST_FAILED");
+    }
+
+    const candidate = data?.candidates?.[0];
+
+    const answer = (candidate?.content?.parts || [])
+      .map(part =>
+        typeof part.text === "string" ? part.text : ""
+      )
+      .join("")
+      .trim();
+
+    if (answer) return answer;
+
+    if (
+      candidate?.finishReason === "SAFETY" ||
+      candidate?.finishReason === "BLOCKLIST"
+    ) {
+      throw new Error("GEMINI_BLOCKED");
     }
 
     console.warn(
-      `Gemini network error; model=${GEMINI_MODEL}; message=${String(
-        error?.message || "unknown error"
-      ).slice(0, 180)}`
+      `Gemini returned no text; model=${model}; finishReason=${String(
+        candidate?.finishReason || "unknown"
+      )}`
     );
 
-    throw new Error("GEMINI_NETWORK_ERROR");
+    lastError = new Error("GEMINI_EMPTY_RESPONSE");
+
+    if (i < models.length - 1 && remainingMs() >= 500) {
+      continue;
+    }
   }
 
-  const { response, data } = result;
-
-  if (!response.ok) {
-    const apiMessage = getGeminiErrorMessage(data);
-
-    console.warn(
-      `Gemini API error; model=${GEMINI_MODEL}; status=${response.status}; message=${apiMessage || "no error message"}`
-    );
-
-    if (response.status === 401 || response.status === 403) {
-      throw new Error("GEMINI_KEY_REJECTED");
-    }
-
-    if (response.status === 404) {
-      throw new Error("GEMINI_MODEL_NOT_FOUND");
-    }
-
-    if (response.status === 429) {
-      throw new Error("GEMINI_QUOTA");
-    }
-
-    if (response.status === 503 || response.status >= 500) {
-      throw new Error("GEMINI_OVERLOADED");
-    }
-
-    if (response.status === 400) {
-      throw new Error("GEMINI_BAD_REQUEST");
-    }
-
-    throw new Error("GEMINI_REQUEST_FAILED");
-  }
-
-  const candidate = data?.candidates?.[0];
-
-  const answer = (candidate?.content?.parts || [])
-    .map(part =>
-      typeof part.text === "string" ? part.text : ""
-    )
-    .join("")
-    .trim();
-
-  if (answer) return answer;
-
-  if (
-    candidate?.finishReason === "SAFETY" ||
-    candidate?.finishReason === "BLOCKLIST"
-  ) {
-    throw new Error("GEMINI_BLOCKED");
-  }
-
-  console.warn(
-    `Gemini returned no text; model=${GEMINI_MODEL}; finishReason=${String(
-      candidate?.finishReason || "unknown"
-    )}`
-  );
-
-  throw new Error("GEMINI_EMPTY_RESPONSE");
+  throw lastError;
 }
 
 function errorForUser(error) {
@@ -412,7 +445,6 @@ export default async function handler(req, res) {
       isSearchIntent(text) &&
       process.env.SERPER_API_KEY
     ) {
-      // Оставляем время для запроса Gemini и ответа Алисе
       const searchBudget = Math.min(
         SERPER_TIMEOUT_MS,
         Math.max(
