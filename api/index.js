@@ -2,11 +2,11 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 
-// Жёсткий лимит Яндекс Алисы — 4,5 секунды. 
-// Оставляем 400 мс на сетевые задержки Vercel и формирование ответа.
-const TOTAL_RESPONSE_BUDGET_MS = 4100; 
+// Увеличиваем общий бюджет до 4.2 секунд (лимит Алисы - 4.5 сек)
+const TOTAL_RESPONSE_BUDGET_MS = 4200; 
 const SERPER_TIMEOUT_MS = 400;
-const GEMINI_TIMEOUT_MS = 3000;
+// Увеличиваем таймаут для Gemini, так как модели нужен запас
+const GEMINI_TIMEOUT_MS = 3800;
 
 const GEMINI_MODEL =
   process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
@@ -175,7 +175,6 @@ function getGeminiErrorMessage(data) {
 // Функция для расчета задержки перед повтором (Exponential Backoff)
 function getBackoffDelay(attempt, baseDelayMs = 600) {
   const exponentialDelay = baseDelayMs * Math.pow(2, attempt);
-  // Добавляем случайный разброс (джиттер) от 0.7 до 1.3
   return Math.floor(exponentialDelay * (0.7 + Math.random() * 0.6));
 }
 
@@ -212,36 +211,29 @@ ${searchContext}
     parts: [{ text: prompt }]
   });
 
-  // Актуальные модели, поддерживающие v1beta (по состоянию на 2026 год)
   const defaultModels = [
-    GEMINI_MODEL,                 // По умолчанию gemini-3.5-flash-lite
-    "gemini-3.5-flash",           // Чуть мощнее, но всё ещё быстрая
-    "gemini-3.1-flash-lite",      // Резервная lite-модель
-    "gemini-3-flash-preview"      // Ещё один быстрый вариант
+    GEMINI_MODEL,
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash"
   ];
 
   const models = [...new Set(defaultModels)];
   let lastError = new Error("GEMINI_REQUEST_FAILED");
 
-  // Проходимся по списку моделей
   for (let i = 0; i < models.length; i++) {
     const model = models[i];
-    
-    // Для каждой модели делаем до 2 попыток
     const maxAttempts = 2;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const remaining = remainingMs();
 
-      // Если времени осталось мало, прерываемся, чтобы не ловить таймаут Алисы
       if (remaining < 800) {
         throw lastError;
       }
 
-      // Оставляем буфер на обработку ответа
       const timeout = Math.min(
         GEMINI_TIMEOUT_MS,
-        Math.max(800, remaining - 300)
+        Math.max(800, remaining - 200)
       );
 
       const url =
@@ -270,7 +262,11 @@ ${searchContext}
               contents,
               generationConfig: {
                 temperature: 0.4,
-                maxOutputTokens: 160
+                maxOutputTokens: 160,
+                // Ключевое исправление: отключаем "размышления"
+                thinkingConfig: {
+                  thinkingBudget: 0
+                }
               }
             })
           },
@@ -284,9 +280,7 @@ ${searchContext}
           console.warn(`Gemini network error; model=${model}`);
           lastError = new Error("GEMINI_NETWORK_ERROR");
         }
-        
-        // При сетевой ошибке или таймауте переходим к следующей модели
-        break; 
+        break;
       }
 
       const { response, data } = result;
@@ -298,7 +292,6 @@ ${searchContext}
           `Gemini API error; model=${model}; status=${response.status}; message=${apiMessage || "no error message"}`
         );
 
-        // Если ключ неверный или квота исчерпана — нет смысла повторять
         if (response.status === 401 || response.status === 403) {
           throw new Error("GEMINI_KEY_REJECTED");
         }
@@ -309,30 +302,26 @@ ${searchContext}
           throw new Error("GEMINI_BAD_REQUEST");
         }
 
-        // Если сервер перегружен (503) или не найден (404)
         if (response.status === 503 || response.status >= 500) {
           lastError = new Error("GEMINI_OVERLOADED");
-          
-          // Если есть время и это не последняя попытка для этой модели, делаем задержку
           if (attempt < maxAttempts - 1 && remainingMs() > 1200) {
             const delay = getBackoffDelay(attempt);
             console.warn(`Model ${model} overloaded. Retrying in ${delay}ms...`);
             await sleep(delay);
-            continue; // Повторяем ту же модель
+            continue;
           }
-          break; // Если попытки кончились, переходим к следующей модели
+          break;
         }
 
         if (response.status === 404) {
            lastError = new Error("GEMINI_MODEL_NOT_FOUND");
-           break; // Переходим к следующей модели
+           break;
         }
 
         lastError = new Error("GEMINI_REQUEST_FAILED");
         break;
       }
 
-      // Если запрос успешен
       const candidate = data?.candidates?.[0];
       const answer = (candidate?.content?.parts || [])
         .map(part => (typeof part.text === "string" ? part.text : ""))
@@ -350,7 +339,7 @@ ${searchContext}
 
       console.warn(`Gemini returned no text; model=${model}; finishReason=${candidate?.finishReason}`);
       lastError = new Error("GEMINI_EMPTY_RESPONSE");
-      break; // Переходим к следующей модели
+      break;
     }
   }
 
@@ -430,10 +419,9 @@ export default async function handler(req, res) {
     let searchContext = "";
 
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // На поиск выделяем не более 400мс, чтобы осталось время на Gemini
       const searchBudget = Math.min(
         SERPER_TIMEOUT_MS,
-        Math.max(0, remainingMs() - 3000) 
+        Math.max(0, remainingMs() - 3200) 
       );
 
       if (searchBudget >= 150) {
@@ -441,8 +429,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // Оставляем буфер в 300мс на финальную обработку ответа
-    const geminiBudget = Math.max(0, remainingMs() - 300);
+    const geminiBudget = Math.max(0, remainingMs() - 200);
 
     const answer = await askGemini(
       text,
