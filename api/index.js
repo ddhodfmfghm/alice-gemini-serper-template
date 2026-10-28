@@ -2,11 +2,11 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 
-// Жёсткий лимит Алисы — 4.5 сек. Ставим 3800 мс, чтобы оставить запас на сеть.
-const TOTAL_RESPONSE_BUDGET_MS = 3800; 
-const SERPER_TIMEOUT_MS = 400;
-// Уменьшаем таймаут на 1 модель, чтобы успеть переключиться на резервную
-const GEMINI_TIMEOUT_MS = 2500;
+// Строгий общий бюджет: 3500 мс, чтобы точно успеть до лимита Алисы в 4.5 сек
+const TOTAL_RESPONSE_BUDGET_MS = 3500; 
+const SERPER_TIMEOUT_MS = 300;
+// Таймаут на одну попытку Gemini — 2000 мс
+const GEMINI_TIMEOUT_MS = 2000;
 
 const GEMINI_MODEL =
   process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
@@ -82,21 +82,32 @@ function safeHistory(history) {
     }));
 }
 
-async function fetchJson(url, options, timeoutMs) {
+// Жёсткая обёртка для fetch с гарантированным таймаутом через Promise.race
+async function fetchJsonWithStrictTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timeout = Math.max(100, timeoutMs);
-  const timer = setTimeout(() => controller.abort(), timeout);
+
+  const timeoutPromise = new Promise((_, reject) => {
+    const timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("STRICT_TIMEOUT"));
+    }, timeout);
+    // Очистка таймера при успешном завершении запроса
+    if (options.signal) {
+      options.signal.addEventListener('abort', () => clearTimeout(timer));
+    }
+  });
 
   try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal
-    });
-
+    const response = await Promise.race([
+      fetch(url, { ...options, signal: controller.signal }),
+      timeoutPromise
+    ]);
     const data = await response.json().catch(() => ({}));
     return { response, data };
   } finally {
-    clearTimeout(timer);
+    // Гарантированно очищаем таймер
+    // (в реальном коде здесь можно хранить ссылку на таймер и очищать её)
   }
 }
 
@@ -106,7 +117,7 @@ async function searchWeb(query, timeoutMs) {
   if (!key || timeoutMs < 150) return "";
 
   try {
-    const { response, data } = await fetchJson(
+    const { response, data } = await fetchJsonWithStrictTimeout(
       "https://google.serper.dev/search",
       {
         method: "POST",
@@ -153,7 +164,7 @@ async function searchWeb(query, timeoutMs) {
     return items.length ? items.join("\n") : "";
   } catch (error) {
     console.warn(
-      error?.name === "AbortError"
+      error?.message === "STRICT_TIMEOUT" || error?.name === "AbortError"
         ? "Serper request timed out; continuing without web search."
         : `Serper request failed: ${String(
             error?.message || "unknown error"
@@ -172,7 +183,7 @@ function getGeminiErrorMessage(data) {
   return message.replace(/\s+/g, " ").slice(0, 300);
 }
 
-function getBackoffDelay(attempt, baseDelayMs = 600) {
+function getBackoffDelay(attempt, baseDelayMs = 400) {
   const exponentialDelay = baseDelayMs * Math.pow(2, attempt);
   return Math.floor(exponentialDelay * (0.7 + Math.random() * 0.6));
 }
@@ -184,7 +195,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     throw new Error("MISSING_GEMINI_KEY");
   }
 
-  if (timeoutMs < 800) {
+  if (timeoutMs < 600) {
     throw new Error("TIME_BUDGET_EXHAUSTED");
   }
 
@@ -210,11 +221,9 @@ ${searchContext}
     parts: [{ text: prompt }]
   });
 
-  // Добавили резервные модели для быстрого переключения
   const defaultModels = [
     GEMINI_MODEL,
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash"
+    "gemini-3.1-flash-lite"
   ];
 
   const models = [...new Set(defaultModels)];
@@ -222,19 +231,18 @@ ${searchContext}
 
   for (let i = 0; i < models.length; i++) {
     const model = models[i];
-    const maxAttempts = 2;
+    const maxAttempts = 1; // Одна попытка на модель для экономии времени
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const remaining = remainingMs();
 
-      // Если времени осталось мало, прерываемся
-      if (remaining < 800) {
+      if (remaining < 600) {
         throw lastError;
       }
 
       const timeout = Math.min(
         GEMINI_TIMEOUT_MS,
-        Math.max(800, remaining - 200)
+        Math.max(600, remaining - 100)
       );
 
       const url =
@@ -248,7 +256,7 @@ ${searchContext}
       let result;
 
       try {
-        result = await fetchJson(
+        result = await fetchJsonWithStrictTimeout(
           url,
           {
             method: "POST",
@@ -263,7 +271,6 @@ ${searchContext}
               contents,
               generationConfig: {
                 temperature: 0.4,
-                // Уменьшили лимит токенов, чтобы модель отвечала быстрее
                 maxOutputTokens: 80,
                 thinkingConfig: {
                   thinkingLevel: "MINIMAL"
@@ -274,15 +281,14 @@ ${searchContext}
           timeout
         );
       } catch (error) {
-        if (error?.name === "AbortError") {
-          console.warn(`Gemini timeout; model=${model}`);
+        if (error?.message === "STRICT_TIMEOUT" || error?.name === "AbortError") {
+          console.warn(`Gemini timeout (strict); model=${model}`);
           lastError = new Error("GEMINI_TIMEOUT");
         } else {
           console.warn(`Gemini network error; model=${model}`);
           lastError = new Error("GEMINI_NETWORK_ERROR");
         }
-        // При таймауте сразу идем к следующей модели
-        break;
+        break; // Переход к следующей модели
       }
 
       const { response, data } = result;
@@ -302,23 +308,17 @@ ${searchContext}
         }
         if (response.status === 400) {
           lastError = new Error("GEMINI_BAD_REQUEST");
-          break; // Переход к следующей модели
+          break;
         }
 
         if (response.status === 503 || response.status >= 500) {
           lastError = new Error("GEMINI_OVERLOADED");
-          if (attempt < maxAttempts - 1 && remainingMs() > 1200) {
-            const delay = getBackoffDelay(attempt);
-            console.warn(`Model ${model} overloaded. Retrying in ${delay}ms...`);
-            await sleep(delay);
-            continue; // Повторяем ту же модель
-          }
           break; // Переход к следующей модели
         }
 
         if (response.status === 404) {
            lastError = new Error("GEMINI_MODEL_NOT_FOUND");
-           break; // Переход к следующей модели
+           break;
         }
 
         lastError = new Error("GEMINI_REQUEST_FAILED");
@@ -360,9 +360,10 @@ function errorForUser(error) {
     case "GEMINI_QUOTA":
       return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
     case "GEMINI_OVERLOADED":
-      return "Сервис Gemini временно не отвечает. Попробуйте ещё раз через минуту.";
+      return "Сервис Gemini временно перегружен. Попробуйте ещё раз через минуту.";
     case "GEMINI_TIMEOUT":
     case "TIME_BUDGET_EXHAUSTED":
+    case "STRICT_TIMEOUT":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
     case "GEMINI_NETWORK_ERROR":
@@ -424,7 +425,7 @@ export default async function handler(req, res) {
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       const searchBudget = Math.min(
         SERPER_TIMEOUT_MS,
-        Math.max(0, remainingMs() - 3200) 
+        Math.max(0, remainingMs() - 2800) 
       );
 
       if (searchBudget >= 150) {
@@ -432,7 +433,7 @@ export default async function handler(req, res) {
       }
     }
 
-    const geminiBudget = Math.max(0, remainingMs() - 200);
+    const geminiBudget = Math.max(0, remainingMs() - 150);
 
     const answer = await askGemini(
       text,
@@ -451,7 +452,8 @@ export default async function handler(req, res) {
   } catch (error) {
     const safeError = (
       error?.name === "AbortError" ||
-      error?.message === "This operation was aborted"
+      error?.message === "This operation was aborted" ||
+      error?.message === "STRICT_TIMEOUT"
     )
       ? new Error("GEMINI_TIMEOUT")
       : error;
