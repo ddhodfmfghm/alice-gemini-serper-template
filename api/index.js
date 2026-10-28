@@ -125,9 +125,8 @@ async function askGemini(text, history, searchContext, maxTotalTimeoutMs) {
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  // ИСПРАВЛЕНИЕ: Используем только реальные, быстрые модели без лишних запросов
-  // gemini-1.5-flash-8b — самая быстрая и имеет лучшие бесплатные лимиты
-  const modelsToTry = ["gemini-1.5-flash-8b", "gemini-1.5-flash"];
+  // ИСПРАВЛЕНИЕ: Используем актуальные модели Gemini 3.5 и 3.1 (Flash-Lite)
+  const modelsToTry = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
 
   const startTime = Date.now();
   let lastError = new Error("GEMINI_REQUEST_FAILED");
@@ -144,7 +143,7 @@ async function askGemini(text, history, searchContext, maxTotalTimeoutMs) {
       break;
     }
 
-    // ИСПРАВЛЕНИЕ: Добавляем цикл для повторных попыток (до 2 раз) при ошибке 503
+    // Добавляем цикл для повторных попыток (до 2 раз) при ошибке 503
     let attempts = 0;
     const maxAttempts = 2;
 
